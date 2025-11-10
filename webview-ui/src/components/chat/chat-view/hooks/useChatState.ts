@@ -24,14 +24,6 @@ export function useChatState(messages: ClineMessage[]): ChatState {
 	// Message queue state
 	const [messageQueue, setMessageQueue] = useState<QueuedMessage[]>([])
 
-	// Debug: Log queue state changes
-	useEffect(() => {
-		console.log("[useChatState] Message queue updated:", {
-			queueLength: messageQueue.length,
-			queue: messageQueue,
-		})
-	}, [messageQueue])
-
 	// Refs
 	const textAreaRef = useRef<HTMLTextAreaElement>(null)
 
@@ -52,12 +44,18 @@ export function useChatState(messages: ClineMessage[]): ChatState {
 		setActiveQuote(null)
 		setSelectedImages([])
 		setSelectedFiles([])
+		setMessageQueue([])
 	}, [])
 
 	// Handle focus change
 	const handleFocusChange = useCallback((isFocused: boolean) => {
 		setIsTextAreaFocused(isFocused)
 	}, [])
+
+	// Clear message queue when task changes (new task started)
+	useEffect(() => {
+		setMessageQueue([])
+	}, [task?.ts])
 
 	return {
 		// State values

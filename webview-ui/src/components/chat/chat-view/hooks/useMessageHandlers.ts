@@ -161,8 +161,9 @@ export function useMessageHandlers(messages: ClineMessage[], chatState: ChatStat
 	// Start a new task
 	const startNewTask = useCallback(async () => {
 		setActiveQuote(null)
+		setMessageQueue([])
 		await TaskServiceClient.clearTask(EmptyRequest.create({}))
-	}, [setActiveQuote])
+	}, [setActiveQuote, setMessageQueue])
 
 	// Clear input state helper
 	const clearInputState = useCallback(() => {
