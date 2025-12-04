@@ -1,3 +1,4 @@
+import { isSubagentCommand, transformClineCommand } from "@integrations/cli-subagents/subagent_command"
 import { ClineToolResponseContent } from "@shared/messages"
 
 import { BackgroundCommandExecutor, BackgroundCommandExecutorConfig } from "./backgroundCommand/BackgroundCommandExecutor"
@@ -36,27 +37,35 @@ export type { CommandExecutorCallbacks, CommandExecutorConfig, ICommandExecutor 
  *   - 10-minute hard timeout protection
  *   - Command cancellation support
  *
+ * IMPORTANT: Subagent commands (cline CLI) are ALWAYS routed to BackgroundCommandExecutor
+ * regardless of the configured mode. This ensures subagents run in hidden/background
+ * terminals rather than cluttering the user's visible VSCode terminal.
+ *
  * The factory pattern allows Task class to use a single interface while
  * the actual implementation is selected at construction time based on mode.
  */
 export class CommandExecutor implements ICommandExecutor {
-	private delegate: ICommandExecutor
+	private vscodeExecutor: VscodeCommandExecutor | undefined
+	private backgroundExecutor: BackgroundCommandExecutor
+	private cwd: string
 
 	constructor(config: FullCommandExecutorConfig, callbacks: CommandExecutorCallbacks) {
-		if (config.terminalExecutionMode === "backgroundExec") {
-			// Standalone/CLI mode - use BackgroundCommandExecutor
-			const backgroundConfig: BackgroundCommandExecutorConfig = {
-				terminalManager: config.terminalManager,
-				backgroundCommandTracker: config.backgroundCommandTracker,
-				terminalExecutionMode: config.terminalExecutionMode,
-				cwd: config.cwd,
-				taskId: config.taskId,
-				ulid: config.ulid,
-				standaloneTerminalModulePath: config.standaloneTerminalModulePath,
-			}
-			this.delegate = new BackgroundCommandExecutor(backgroundConfig, callbacks)
-		} else {
-			// VSCode terminal mode - use VscodeCommandExecutor
+		this.cwd = config.cwd
+
+		// Always create BackgroundCommandExecutor (needed for subagents even in VSCode mode)
+		const backgroundConfig: BackgroundCommandExecutorConfig = {
+			terminalManager: config.terminalManager,
+			backgroundCommandTracker: config.backgroundCommandTracker,
+			terminalExecutionMode: "backgroundExec",
+			cwd: config.cwd,
+			taskId: config.taskId,
+			ulid: config.ulid,
+			standaloneTerminalModulePath: config.standaloneTerminalModulePath,
+		}
+		this.backgroundExecutor = new BackgroundCommandExecutor(backgroundConfig, callbacks)
+
+		// Only create VscodeCommandExecutor if in VSCode mode
+		if (config.terminalExecutionMode === "vscodeTerminal") {
 			const vscodeConfig: VscodeCommandExecutorConfig = {
 				terminalManager: config.terminalManager,
 				terminalExecutionMode: config.terminalExecutionMode,
@@ -65,37 +74,63 @@ export class CommandExecutor implements ICommandExecutor {
 				ulid: config.ulid,
 				standaloneTerminalModulePath: config.standaloneTerminalModulePath,
 			}
-			this.delegate = new VscodeCommandExecutor(vscodeConfig, callbacks)
+			this.vscodeExecutor = new VscodeCommandExecutor(vscodeConfig, callbacks)
 		}
 	}
 
 	/**
 	 * Execute a command in the terminal
-	 * Delegates to the appropriate executor based on mode
+	 *
+	 * Routing logic:
+	 * 1. Subagent commands (cline CLI) → Always use BackgroundCommandExecutor
+	 *    This ensures subagents run in hidden terminals, not cluttering the user's VSCode terminal
+	 * 2. Regular commands → Use the configured executor based on terminalExecutionMode
 	 */
 	execute(command: string, timeoutSeconds: number | undefined): Promise<[boolean, ClineToolResponseContent]> {
-		return this.delegate.execute(command, timeoutSeconds)
+		// Transform subagent commands to ensure flags are correct
+		const isSubagent = isSubagentCommand(command)
+		if (isSubagent) {
+			command = transformClineCommand(command)
+		}
+
+		// Strip leading `cd` to workspace from command
+		const workspaceCdPrefix = `cd ${this.cwd} && `
+		if (command.startsWith(workspaceCdPrefix)) {
+			command = command.substring(workspaceCdPrefix.length)
+		}
+
+		// Route subagents to background executor (hidden terminal)
+		// This prevents subagent output from cluttering the user's visible VSCode terminal
+		if (isSubagent) {
+			return this.backgroundExecutor.execute(command, timeoutSeconds)
+		}
+
+		// Regular commands use the configured executor
+		if (this.vscodeExecutor) {
+			return this.vscodeExecutor.execute(command, timeoutSeconds)
+		}
+		return this.backgroundExecutor.execute(command, timeoutSeconds)
 	}
 
 	/**
 	 * Cancel the currently running background command
-	 * Only supported in backgroundExec mode
+	 * Delegates to BackgroundCommandExecutor (VSCode executor doesn't support cancellation)
 	 */
 	cancelBackgroundCommand(): Promise<boolean> {
-		return this.delegate.cancelBackgroundCommand()
+		return this.backgroundExecutor.cancelBackgroundCommand()
 	}
 
 	/**
 	 * Check if there's an active background command
 	 */
 	hasActiveBackgroundCommand(): boolean {
-		return this.delegate.hasActiveBackgroundCommand()
+		return this.backgroundExecutor.hasActiveBackgroundCommand()
 	}
 
 	/**
 	 * Get the active background command info
 	 */
 	getActiveBackgroundCommand(): ActiveBackgroundCommand | undefined {
-		return this.delegate.getActiveBackgroundCommand()
+		return this.backgroundExecutor.getActiveBackgroundCommand()
 	}
 }

@@ -1,6 +1,5 @@
 import { setTimeout as setTimeoutPromise } from "node:timers/promises"
 import { formatResponse } from "@core/prompts/responses"
-import { isSubagentCommand, transformClineCommand } from "@integrations/cli-subagents/subagent_command"
 import { processFilesIntoText } from "@integrations/misc/extract-text"
 import { Logger } from "@services/logging/Logger"
 import { TerminalHangStage, telemetryService } from "@services/telemetry"
@@ -37,15 +36,16 @@ const COMPLETION_TIMEOUT_MS = 6000 // 6 seconds
  * - Has 10-minute hard timeout protection via BackgroundCommandTracker
  * - Supports command cancellation
  *
- * Used when terminalExecutionMode === "backgroundExec"
+ * NOTE: Command preprocessing (subagent detection, cd stripping) is handled
+ * at the CommandExecutor factory level before reaching this method.
+ *
+ * Used when terminalExecutionMode === "backgroundExec" OR for subagent commands
  */
 export class BackgroundCommandExecutor implements ICommandExecutor {
 	private terminalManager: TerminalManager
 	private backgroundCommandTracker: BackgroundCommandTracker | undefined
 	private cwd: string
-	private taskId: string
 	private ulid: string
-	private standaloneTerminalModulePath: string
 	private callbacks: CommandExecutorCallbacks
 
 	// Track active background command for cancellation
@@ -61,64 +61,26 @@ export class BackgroundCommandExecutor implements ICommandExecutor {
 		this.terminalManager = config.terminalManager
 		this.backgroundCommandTracker = config.backgroundCommandTracker
 		this.cwd = config.cwd
-		this.taskId = config.taskId
 		this.ulid = config.ulid
-		this.standaloneTerminalModulePath = config.standaloneTerminalModulePath
 		this.callbacks = callbacks
 	}
 
 	/**
 	 * Execute a command in background/standalone mode
-	 * @param command The command to execute
+	 *
+	 * NOTE: Command preprocessing (subagent detection, cd stripping) is handled
+	 * at the CommandExecutor factory level before reaching this method.
+	 *
+	 * @param command The command to execute (already preprocessed)
 	 * @param timeoutSeconds Optional timeout in seconds (triggers "Proceed While Running" behavior)
 	 * @returns [userRejected, result] tuple
 	 */
 	async execute(command: string, timeoutSeconds: number | undefined): Promise<[boolean, ClineToolResponseContent]> {
-		// For Cline CLI subagents, we want to parse and process the command to ensure flags are correct
-		const isSubagent = isSubagentCommand(command)
-
-		if (transformClineCommand(command) !== command && isSubagent) {
-			command = transformClineCommand(command)
-		}
-
-		// Strip leading `cd` to workspace from command
-		const workspaceCdPrefix = `cd ${this.cwd} && `
-		if (command.startsWith(workspaceCdPrefix)) {
-			command = command.substring(workspaceCdPrefix.length)
-		}
-
-		const subAgentStartTime = isSubagent ? performance.now() : 0
-
 		Logger.info("Executing command in background mode: " + command)
 
-		let terminalManager: TerminalManager
-		if (isSubagent) {
-			// Create a background TerminalManager for CLI subagents
-			try {
-				const { StandaloneTerminalManager } = require(this.standaloneTerminalModulePath) as {
-					StandaloneTerminalManager?: new () => TerminalManager
-				}
-				if (StandaloneTerminalManager) {
-					terminalManager = new StandaloneTerminalManager()
-				} else {
-					terminalManager = new TerminalManager()
-				}
-			} catch (error) {
-				console.error("[DEBUG] Failed to load standalone terminal manager for subagent", error)
-				terminalManager = new TerminalManager()
-			}
-			terminalManager.setShellIntegrationTimeout(this.terminalManager["shellIntegrationTimeout"] || 4000)
-			terminalManager.setTerminalReuseEnabled(this.terminalManager["terminalReuseEnabled"] ?? true)
-			terminalManager.setTerminalOutputLineLimit(this.terminalManager["terminalOutputLineLimit"] || 500)
-			terminalManager.setSubagentTerminalOutputLineLimit(this.terminalManager["subagentTerminalOutputLineLimit"] || 2000)
-		} else {
-			// Use the configured terminal manager for regular commands
-			terminalManager = this.terminalManager
-		}
-
-		const terminalInfo = await terminalManager.getOrCreateTerminal(this.cwd)
+		const terminalInfo = await this.terminalManager.getOrCreateTerminal(this.cwd)
 		terminalInfo.terminal.show()
-		const process = terminalManager.runCommand(terminalInfo, command)
+		const process = this.terminalManager.runCommand(terminalInfo, command)
 
 		// Track command execution
 		this.callbacks.updateBackgroundCommandState(true)
@@ -279,7 +241,6 @@ export class BackgroundCommandExecutor implements ICommandExecutor {
 						cleanupProceedCheck,
 						chunkTimer,
 						completionTimer,
-						terminalManager,
 					)
 				}
 			} catch (error: any) {
@@ -293,7 +254,6 @@ export class BackgroundCommandExecutor implements ICommandExecutor {
 						cleanupProceedCheck,
 						chunkTimer,
 						completionTimer,
-						terminalManager,
 					)
 				}
 				throw error
@@ -311,7 +271,6 @@ export class BackgroundCommandExecutor implements ICommandExecutor {
 					cleanupProceedCheck,
 					chunkTimer,
 					completionTimer,
-					terminalManager,
 				)
 			}
 		}
@@ -330,17 +289,7 @@ export class BackgroundCommandExecutor implements ICommandExecutor {
 		// Wait for a short delay to ensure all messages are sent to the webview
 		await setTimeoutPromise(50)
 
-		const result = terminalManager.processOutput(
-			outputLines,
-			isSubagent ? terminalManager["subagentTerminalOutputLineLimit"] : undefined,
-			isSubagent,
-		)
-
-		// Capture subagent telemetry if this was a subagent command
-		if (isSubagent && subAgentStartTime > 0) {
-			const durationMs = Math.round(performance.now() - subAgentStartTime)
-			telemetryService.captureSubagentExecution(this.ulid, durationMs, outputLines.length, completed)
-		}
+		const result = this.terminalManager.processOutput(outputLines)
 
 		if (userFeedback) {
 			await this.callbacks.say("user_feedback", userFeedback.text, userFeedback.images, userFeedback.files)
@@ -385,7 +334,6 @@ export class BackgroundCommandExecutor implements ICommandExecutor {
 		cleanupProceedCheck: (() => void) | undefined,
 		chunkTimer: NodeJS.Timeout | null,
 		completionTimer: NodeJS.Timeout | null,
-		terminalManager: TerminalManager,
 	): Promise<[boolean, string]> {
 		let trackedCommand: { logFilePath: string } | undefined
 		if (this.backgroundCommandTracker) {
@@ -411,7 +359,7 @@ export class BackgroundCommandExecutor implements ICommandExecutor {
 		}
 
 		await setTimeoutPromise(50)
-		const result = terminalManager.processOutput(outputLines, undefined, false)
+		const result = this.terminalManager.processOutput(outputLines)
 
 		// Build response message
 		const logMsg = trackedCommand ? `Log file: ${trackedCommand.logFilePath}\n` : ""
