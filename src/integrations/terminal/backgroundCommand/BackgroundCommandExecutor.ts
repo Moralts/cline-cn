@@ -16,6 +16,7 @@ import { BackgroundCommandTracker } from "./BackgroundCommandTracker"
 export interface BackgroundCommandExecutorConfig extends CommandExecutorConfig {
 	terminalManager: TerminalManager
 	backgroundCommandTracker: BackgroundCommandTracker | undefined
+	standaloneTerminalModulePath: string
 }
 
 // Chunked terminal output buffering constants
@@ -58,11 +59,30 @@ export class BackgroundCommandExecutor implements ICommandExecutor {
 	}
 
 	constructor(config: BackgroundCommandExecutorConfig, callbacks: CommandExecutorCallbacks) {
-		this.terminalManager = config.terminalManager
 		this.backgroundCommandTracker = config.backgroundCommandTracker
 		this.cwd = config.cwd
 		this.ulid = config.ulid
 		this.callbacks = callbacks
+
+		// Load StandaloneTerminalManager for background/standalone execution
+		// This is the key difference from VscodeCommandExecutor - we use detached processes
+		try {
+			const { StandaloneTerminalManager } = require(config.standaloneTerminalModulePath) as {
+				StandaloneTerminalManager: new () => TerminalManager
+			}
+			this.terminalManager = new StandaloneTerminalManager()
+			Logger.info("BackgroundCommandExecutor: Using StandaloneTerminalManager")
+		} catch (error) {
+			// Fallback to regular TerminalManager if loading fails
+			Logger.error("BackgroundCommandExecutor: Failed to load StandaloneTerminalManager, using fallback", error)
+			this.terminalManager = config.terminalManager
+		}
+
+		// Copy settings from the provided terminalManager to ensure consistency
+		this.terminalManager.setShellIntegrationTimeout(config.terminalManager["shellIntegrationTimeout"] || 4000)
+		this.terminalManager.setTerminalReuseEnabled(config.terminalManager["terminalReuseEnabled"] ?? true)
+		this.terminalManager.setTerminalOutputLineLimit(config.terminalManager["terminalOutputLineLimit"] || 500)
+		this.terminalManager.setSubagentTerminalOutputLineLimit(config.terminalManager["subagentTerminalOutputLineLimit"] || 2000)
 	}
 
 	/**

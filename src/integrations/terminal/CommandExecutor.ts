@@ -53,6 +53,7 @@ export class CommandExecutor implements ICommandExecutor {
 		this.cwd = config.cwd
 
 		// Always create BackgroundCommandExecutor (needed for subagents even in VSCode mode)
+		// BackgroundCommandExecutor will load StandaloneTerminalManager for detached process execution
 		const backgroundConfig: BackgroundCommandExecutorConfig = {
 			terminalManager: config.terminalManager,
 			backgroundCommandTracker: config.backgroundCommandTracker,
