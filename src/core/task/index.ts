@@ -526,6 +526,15 @@ export class Task {
 
 		const commandExecutorCallbacks: CommandExecutorCallbacks = {
 			say: this.say.bind(this) as CommandExecutorCallbacks["say"],
+			ask: async (type: string, text?: string, partial?: boolean) => {
+				const result = await this.ask(type as ClineAsk, text, partial)
+				return {
+					response: result.response,
+					text: result.text,
+					images: result.images,
+					files: result.files,
+				}
+			},
 			updateBackgroundCommandState: (isRunning: boolean) =>
 				this.controller.updateBackgroundCommandState(isRunning, this.taskId),
 			updateClineMessage: async (index: number, updates: { commandCompleted?: boolean }) => {

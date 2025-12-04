@@ -43,13 +43,28 @@ export interface ActiveBackgroundCommand {
 }
 
 /**
+ * Response from an ask() call
+ */
+export interface AskResponse {
+	response: string // "yesButtonClicked" | "noButtonClicked" | "messageResponse"
+	text?: string
+	images?: string[]
+	files?: string[]
+}
+
+/**
  * Callbacks for CommandExecutor to interact with Task state
  * These are bound methods from the Task class that allow CommandExecutor
  * to update UI and state without owning that state directly.
  */
 export interface CommandExecutorCallbacks {
-	/** Display a message in the chat UI */
+	/** Display a message in the chat UI (non-blocking) */
 	say: (type: string, text?: string, images?: string[], files?: string[], partial?: boolean) => Promise<number | undefined>
+	/**
+	 * Ask the user a question and wait for response (blocking)
+	 * This is used for "Proceed While Running" flow where we need to wait for user input
+	 */
+	ask: (type: string, text?: string, partial?: boolean) => Promise<AskResponse>
 	/** Update the background command running state in the controller */
 	updateBackgroundCommandState: (running: boolean) => void
 	/** Update a cline message by index */

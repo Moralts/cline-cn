@@ -2,7 +2,8 @@ import { setTimeout as setTimeoutPromise } from "node:timers/promises"
 import { formatResponse } from "@core/prompts/responses"
 import { processFilesIntoText } from "@integrations/misc/extract-text"
 import { Logger } from "@services/logging/Logger"
-import { TerminalHangStage, telemetryService } from "@services/telemetry"
+import { TerminalHangStage, TerminalUserInterventionAction, telemetryService } from "@services/telemetry"
+import { COMMAND_CANCEL_TOKEN } from "@shared/ExtensionMessage"
 import { ClineToolResponseContent } from "@shared/messages"
 
 import { ActiveBackgroundCommand, CommandExecutorCallbacks, CommandExecutorConfig, ICommandExecutor } from "../ICommandExecutor"
@@ -131,14 +132,8 @@ export class BackgroundCommandExecutor implements ICommandExecutor {
 
 		let userFeedback: { text?: string; images?: string[]; files?: string[] } | undefined
 		let didContinue = false
-
-		// Create a promise that resolves when user clicks "Proceed While Running"
-		let cleanupProceedCheck: (() => void) | undefined
-		const proceedPromise = new Promise<"proceed">((resolve) => {
-			// Note: This check is handled by the Task class through askResponse state
-			// For now, we'll rely on the timeout/completion flow
-			cleanupProceedCheck = () => {}
-		})
+		let didCancelViaUi = false
+		let proceedWhileRunningTriggered = false // Flag to signal early return with handleProceedWhileRunning result
 
 		// Chunked terminal output buffering
 		let outputBuffer: string[] = []
@@ -148,6 +143,11 @@ export class BackgroundCommandExecutor implements ICommandExecutor {
 		// Track if buffer gets stuck
 		let bufferStuckTimer: NodeJS.Timeout | null = null
 
+		/**
+		 * Flush buffered output to the UI using ask() which waits for user response.
+		 * This is the key mechanism for "Proceed While Running" - when user clicks the button,
+		 * the ask() returns with response "yesButtonClicked".
+		 */
 		const flushBuffer = async (force = false) => {
 			if (outputBuffer.length === 0 && !force) {
 				return
@@ -163,17 +163,51 @@ export class BackgroundCommandExecutor implements ICommandExecutor {
 					bufferStuckTimer = null
 				}, BUFFER_STUCK_TIMEOUT_MS)
 
-				// Use say() to stream output without blocking
-				await this.callbacks.say("command_output", chunk)
+				try {
+					// Use ask() to present output and wait for user response
+					// This enables "Proceed While Running" button functionality
+					const { response, text, images, files } = await this.callbacks.ask("command_output", chunk)
 
-				// Clear the stuck timer since we successfully sent output
-				if (bufferStuckTimer) {
-					clearTimeout(bufferStuckTimer)
-					bufferStuckTimer = null
+					if (response === "yesButtonClicked") {
+						// Track when user clicks "Proceed While Running"
+						telemetryService.captureTerminalUserIntervention(TerminalUserInterventionAction.PROCESS_WHILE_RUNNING)
+						// Proceed while running - but still capture user feedback if provided
+						if (text || (images && images.length > 0) || (files && files.length > 0)) {
+							userFeedback = { text, images, files }
+						}
+						// Signal that we should call handleProceedWhileRunning
+						proceedWhileRunningTriggered = true
+						didContinue = true
+					} else if (response === "noButtonClicked" && text === COMMAND_CANCEL_TOKEN) {
+						telemetryService.captureTerminalUserIntervention(TerminalUserInterventionAction.CANCELLED)
+						didCancelViaUi = true
+						userFeedback = undefined
+						didContinue = true
+						process.continue()
+						outputBuffer = []
+						outputBufferSize = 0
+						await this.callbacks.say("command_output", "Command cancelled")
+					} else {
+						userFeedback = { text, images, files }
+						didContinue = true
+						process.continue()
+						// If more output accumulated, flush again
+						if (outputBuffer.length > 0) {
+							await flushBuffer()
+						}
+					}
+				} catch {
+					Logger.error("Error while asking for command output")
+				} finally {
+					// Clear the stuck timer
+					if (bufferStuckTimer) {
+						clearTimeout(bufferStuckTimer)
+						bufferStuckTimer = null
+					}
 				}
 			} else {
-				// After "Proceed While Running" in background mode: DON'T stream to UI
-				// Output is being logged to temp file by BackgroundCommandTracker
+				// After "Proceed While Running" in background mode: stream directly to UI
+				await this.callbacks.say("command_output", chunk)
 			}
 		}
 
@@ -186,6 +220,9 @@ export class BackgroundCommandExecutor implements ICommandExecutor {
 
 		const outputLines: string[] = []
 		process.on("line", async (line) => {
+			if (didCancelViaUi) {
+				return
+			}
 			outputLines.push(line)
 
 			// Track output in activeBackgroundCommand for cancellation
@@ -203,8 +240,10 @@ export class BackgroundCommandExecutor implements ICommandExecutor {
 				} else {
 					scheduleFlush()
 				}
+			} else {
+				// After "Proceed While Running": stream output directly to UI
+				await this.callbacks.say("command_output", line)
 			}
-			// After "Proceed While Running": output is logged to file, not streamed to UI
 		})
 
 		let completed = false
@@ -239,65 +278,42 @@ export class BackgroundCommandExecutor implements ICommandExecutor {
 			await this.callbacks.say("shell_integration_warning")
 		})
 
-		// In background mode, handle timeout or "Proceed While Running"
-		if (timeoutSeconds) {
-			const timeoutPromise = new Promise<never>((_, reject) => {
-				setTimeout(() => {
-					reject(new Error("COMMAND_TIMEOUT"))
-				}, timeoutSeconds * 1000)
-			})
+		// Handle timeout if specified, or wait for user to click "Proceed While Running"
+		if (!didCancelViaUi) {
+			if (timeoutSeconds) {
+				const timeoutPromise = new Promise<never>((_, reject) => {
+					setTimeout(() => {
+						reject(new Error("COMMAND_TIMEOUT"))
+					}, timeoutSeconds * 1000)
+				})
 
-			try {
-				// Race between: process completion, timeout, and user clicking "Proceed While Running"
-				const raceResult = await Promise.race([process.then(() => "completed" as const), timeoutPromise, proceedPromise])
+				try {
+					await Promise.race([process, timeoutPromise])
+				} catch (error: any) {
+					if (error.message === "COMMAND_TIMEOUT") {
+						// Timeout triggers "Proceed While Running" behavior
+						return await this.handleProceedWhileRunning(
+							process,
+							command,
+							outputLines,
+							undefined,
+							chunkTimer,
+							completionTimer,
+						)
+					}
 
-				// Handle user clicking "Proceed While Running"
-				if (raceResult === "proceed") {
-					didContinue = true
-					return await this.handleProceedWhileRunning(
-						process,
-						command,
-						outputLines,
-						cleanupProceedCheck,
-						chunkTimer,
-						completionTimer,
-					)
+					// Re-throw other errors
+					throw error
 				}
-			} catch (error: any) {
-				if (error.message === "COMMAND_TIMEOUT") {
-					// Handle timeout the same way as "Proceed While Running"
-					didContinue = true
-					return await this.handleProceedWhileRunning(
-						process,
-						command,
-						outputLines,
-						cleanupProceedCheck,
-						chunkTimer,
-						completionTimer,
-					)
-				}
-				throw error
-			}
-		} else {
-			// No timeout - race between completion and "Proceed While Running"
-			const raceResult = await Promise.race([process.then(() => "completed" as const), proceedPromise])
-
-			if (raceResult === "proceed") {
-				didContinue = true
-				return await this.handleProceedWhileRunning(
-					process,
-					command,
-					outputLines,
-					cleanupProceedCheck,
-					chunkTimer,
-					completionTimer,
-				)
+			} else {
+				// No timeout - wait for process to complete OR user to click "Proceed While Running"
+				await process
 			}
 		}
 
-		// Cleanup the proceed check interval if still running
-		if (cleanupProceedCheck) {
-			cleanupProceedCheck()
+		// Check if user clicked "Proceed While Running" during output streaming
+		if (proceedWhileRunningTriggered) {
+			return await this.handleProceedWhileRunning(process, command, outputLines, undefined, chunkTimer, completionTimer)
 		}
 
 		// Clear timer if process completes normally
