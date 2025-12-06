@@ -2,8 +2,6 @@
 
 ## 3.40.2
 
-### Patch Changes
-
 - ee15482: Add Codex models to OpenAI provider with Responses API support. Native tool calling must be enabled.
 - 4e3fe00: Add DeepSeek 3.2 to native tool calling allow list
 - 81d4ff9: Refactor OpenAI provider to centralize temperature configuration and fix missing GPT-5 model settings.
